@@ -19,7 +19,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-USER_AGENT = "VixinVenomStateRadio/7.0 (Second Life internet radio)"
+USER_AGENT = "VixinVenomStateRadio/7.1 (Second Life internet radio)"
 RADIO_BROWSER_DISCOVERY = "https://all.api.radio-browser.info/json/servers"
 RADIO_BROWSER_FALLBACKS = [
     "https://de1.api.radio-browser.info",
@@ -227,24 +227,39 @@ def get_state_list(country_code: str) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         raise RuntimeError("Radio Browser returned an unexpected state list.")
 
-    seen: set[str] = set()
-    states: list[dict[str, Any]] = []
+    # Only return recognized states/provinces. The upstream directory can
+    # contain non-standard region labels; filtering here keeps the response
+    # small and predictable for Second Life's limited HTTP/JSON parser.
+    allowed_names = (
+        set(US_STATES.values()) if country_code == "US"
+        else set(CA_PROVINCES.values())
+    )
+    allowed_lookup = {name.casefold(): name for name in allowed_names}
+    counts_by_name: dict[str, int] = {}
+
     for row in rows:
         raw_name = str(row.get("name") or "").strip()
         if not raw_name:
             continue
         name = canonical_state(raw_name, country_code)
-        key = name.casefold()
-        if key in seen:
+        canonical = allowed_lookup.get(name.casefold())
+        if not canonical:
             continue
-        seen.add(key)
         try:
             count = max(0, int(row.get("stationcount") or 0))
         except (TypeError, ValueError):
             count = 0
         if count:
-            states.append({"name": name, "count": count})
+            # Combine duplicate upstream entries for the same subdivision.
+            counts_by_name[canonical] = max(
+                counts_by_name.get(canonical, 0), count
+            )
 
+    states = [
+        {"name": name, "count": counts_by_name[name]}
+        for name in allowed_names
+        if name in counts_by_name
+    ]
     states.sort(key=lambda item: (-item["count"], item["name"].casefold()))
     STATE_CACHE[country_code] = (now + 1800, states)
     return states
@@ -292,7 +307,7 @@ def home():
     return jsonify(
         ok=True,
         service="VixinVenom State Radio",
-        version="7.0",
+        version="7.1",
         endpoints=[
             "/health",
             "/countries",
@@ -308,7 +323,7 @@ def health():
     return jsonify(
         ok=True,
         service="VixinVenom State Radio",
-        version="7.0",
+        version="7.1",
         browse_mode="country_then_state",
         dialog_page_size=PAGE_SIZE,
         station_check="Radio Browser recent health check plus live probe on play",
@@ -330,11 +345,10 @@ def states():
         return jsonify(ok=False, error="Choose US or CA."), 400
     try:
         available = get_state_list(country_code)
+        # Minimal JSON for LSL: never send the raw directory payload.
         return jsonify(
             ok=True,
-            version="7.0",
             country=country_code,
-            country_name=COUNTRIES[country_code],
             total_states=len(available),
             states=available,
         )
@@ -368,7 +382,7 @@ def stations():
         batch = catalog[start:start + PAGE_SIZE]
         return jsonify(
             ok=True,
-            version="7.0",
+            version="7.1",
             country=country_code,
             country_name=COUNTRIES[country_code],
             state=canonical,
