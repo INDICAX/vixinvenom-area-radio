@@ -1,15 +1,15 @@
-"""VixinVenom Area Radio service v6.
+"""VixinVenom State Radio service v7.
 
-Searches Radio Browser by approximate area-code center, groups indexed stations
-by state/province, filters stations whose most recent directory check is not OK,
-and performs a lightweight live HTTP stream probe when a station is selected.
+Browse internet radio stations by country and state/province. No area codes,
+location lookup, or AM/FM categorization is used. Stations are filtered using
+Radio Browser health data and checked again when Play is selected.
 """
 from __future__ import annotations
 
-import math
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -18,9 +18,8 @@ import requests
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
-USER_AGENT = "VixinVenomAreaRadio/6.0 (Second Life internet radio)"
-AREA_API = "https://areacodecheck.com/api/phone/{}"
-GEOCODING_API = "https://geocoding-api.open-meteo.com/v1/search"
+
+USER_AGENT = "VixinVenomStateRadio/7.0 (Second Life internet radio)"
 RADIO_BROWSER_DISCOVERY = "https://all.api.radio-browser.info/json/servers"
 RADIO_BROWSER_FALLBACKS = [
     "https://de1.api.radio-browser.info",
@@ -31,43 +30,55 @@ REQUEST_TIMEOUT = 25
 PLAY_CONNECT_TIMEOUT = 5
 PLAY_READ_TIMEOUT = 8
 PAGE_SIZE = 6
-SEARCH_RADIUS_KM = int(os.getenv("SEARCH_RADIUS_KM", "800"))
-MAX_STATION_AGE_DAYS = int(os.getenv("MAX_STATION_AGE_DAYS", "14"))
+MAX_STATION_AGE_DAYS = int(os.getenv("MAX_STATION_AGE_DAYS", "30"))
 
-AREA_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-STATION_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-COUNTRY_STATION_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
-MIRROR_CACHE: tuple[float, list[str]] | None = None
-FAILED_PLAY_CACHE: dict[str, float] = {}
-
-AREA_OVERRIDES: dict[str, dict[str, Any]] = {
-    "775": {"location": "Reno / Northern Nevada", "state": "Nevada", "latitude": 39.5296, "longitude": -119.8138, "country_code": "US"},
-    "702": {"location": "Las Vegas / Southern Nevada", "state": "Nevada", "latitude": 36.1699, "longitude": -115.1398, "country_code": "US"},
-    "725": {"location": "Las Vegas / Southern Nevada", "state": "Nevada", "latitude": 36.1699, "longitude": -115.1398, "country_code": "US"},
-    "510": {"location": "Oakland / East Bay", "state": "California", "latitude": 37.8044, "longitude": -122.2712, "country_code": "US"},
+COUNTRIES = {
+    "US": "United States",
+    "CA": "Canada",
+}
+API_COUNTRIES = {
+    "US": "United States of America",
+    "CA": "Canada",
 }
 
 US_STATES = {
-    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California",
-    "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia",
-    "HI": "Hawaii", "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
-    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts",
-    "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi", "MO": "Missouri", "MT": "Montana",
-    "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico",
-    "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
     "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
-    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont",
-    "VA": "Virginia", "WA": "Washington", "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
-    "DC": "District of Columbia",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia",
 }
-US_STATE_LOOKUP = {v.casefold(): v for v in US_STATES.values()}
-US_STATE_LOOKUP.update({k.casefold(): v for k, v in US_STATES.items()})
+CA_PROVINCES = {
+    "AB": "Alberta", "BC": "British Columbia", "MB": "Manitoba",
+    "NB": "New Brunswick", "NL": "Newfoundland and Labrador",
+    "NS": "Nova Scotia", "NT": "Northwest Territories", "NU": "Nunavut",
+    "ON": "Ontario", "PE": "Prince Edward Island", "QC": "Quebec",
+    "SK": "Saskatchewan", "YT": "Yukon",
+}
+SUBDIVISIONS = {f"US-{k}": v for k, v in US_STATES.items()}
+SUBDIVISIONS.update({f"CA-{k}": v for k, v in CA_PROVINCES.items()})
+
+STATE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+STATION_CACHE: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
+MIRROR_CACHE: tuple[float, list[str]] | None = None
+FAILED_PLAY_CACHE: dict[str, float] = {}
 
 
 def get_json(url: str, params: dict[str, Any] | None = None) -> Any:
-    response = requests.get(url, params=params,
+    response = requests.get(
+        url,
+        params=params,
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-        timeout=REQUEST_TIMEOUT)
+        timeout=REQUEST_TIMEOUT,
+    )
     response.raise_for_status()
     return response.json()
 
@@ -77,297 +88,329 @@ def radio_browser_mirrors() -> list[str]:
     now = time.time()
     if MIRROR_CACHE and MIRROR_CACHE[0] > now:
         return MIRROR_CACHE[1]
+
     mirrors: list[str] = []
     try:
-        for item in get_json(RADIO_BROWSER_DISCOVERY):
-            host = str(item.get("name") or "").strip().lower()
-            if re.fullmatch(r"[a-z0-9.-]+\.api\.radio-browser\.info", host) and not host.startswith("all."):
-                base = "https://" + host
-                if base not in mirrors:
-                    mirrors.append(base)
+        payload = get_json(RADIO_BROWSER_DISCOVERY)
+        if isinstance(payload, list):
+            for item in payload:
+                host = str(item.get("name") or "").strip().lower()
+                if re.fullmatch(r"[a-z0-9.-]+\.api\.radio-browser\.info", host) and not host.startswith("all."):
+                    candidate = "https://" + host
+                    if candidate not in mirrors:
+                        mirrors.append(candidate)
     except (requests.RequestException, ValueError, TypeError, AttributeError):
         pass
-    for base in RADIO_BROWSER_FALLBACKS:
-        if base not in mirrors:
-            mirrors.append(base)
+
+    for candidate in RADIO_BROWSER_FALLBACKS:
+        if candidate not in mirrors:
+            mirrors.append(candidate)
+
     MIRROR_CACHE = (now + 600, mirrors)
     return mirrors
 
 
 def rb_json(path: str, params: dict[str, Any] | None = None) -> Any:
-    errors = []
+    errors: list[str] = []
     for base in radio_browser_mirrors():
         try:
-            r = requests.get(base + path, params=params,
+            response = requests.get(
+                base + path,
+                params=params,
                 headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-                timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            return r.json()
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            return response.json()
         except requests.HTTPError as exc:
-            errors.append(f"{base}: HTTP {exc.response.status_code if exc.response is not None else '?'}")
+            code = exc.response.status_code if exc.response is not None else "?"
+            errors.append(f"{base}: HTTP {code}")
         except (requests.RequestException, ValueError) as exc:
             errors.append(f"{base}: {type(exc).__name__}")
     raise RuntimeError("Radio Browser mirrors unavailable: " + "; ".join(errors[:3]))
 
 
-def resolve_area_code(area: str) -> dict[str, Any]:
-    now = time.time()
-    cached = AREA_CACHE.get(area)
-    if cached and cached[0] > now:
-        return cached[1]
-    if area in AREA_OVERRIDES:
-        place = AREA_OVERRIDES[area]
-        AREA_CACHE[area] = (now + 86400, place)
-        return place
-    payload = get_json(AREA_API.format(area + "2345678"))
-    data = payload.get("data") or {}
-    region = str(data.get("area_location") or "").strip()
-    country_name = str(data.get("area_country") or "").strip()
-    if not region:
-        raise ValueError("Area code could not be matched to a state or province.")
-    country_code = "CA" if "canada" in country_name.casefold() else "US"
-    geo = get_json(GEOCODING_API, {"name": region, "count": 30, "language": "en", "format": "json"})
-    candidates = [x for x in (geo.get("results") or []) if str(x.get("country_code") or "").upper() == country_code]
-    if not candidates:
-        raise ValueError("Could not find coordinates for " + region)
-    chosen = candidates[0]
-    for candidate in candidates:
-        if str(candidate.get("name") or "").casefold() == region.casefold() or str(candidate.get("admin1") or "").casefold() == region.casefold():
-            chosen = candidate
-            break
-    state = str(chosen.get("admin1") or chosen.get("name") or region).strip()
-    place = {"location": f"{state}, {chosen.get('country') or country_name}".strip(", "),
-             "state": state, "latitude": float(chosen["latitude"]),
-             "longitude": float(chosen["longitude"]), "country_code": country_code}
-    AREA_CACHE[area] = (now + 86400, place)
-    return place
+def canonical_state(raw: str, country_code: str) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "")).strip()
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    # Radio directories sometimes append country/region text to the state field.
+    text = text.split(",", 1)[0].strip()
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
+    iso = text.upper()
+    if iso in SUBDIVISIONS:
+        return SUBDIVISIONS[iso]
+    if "-" in iso and iso.split("-")[-1] in (US_STATES if country_code == "US" else CA_PROVINCES):
+        code = iso.split("-")[-1]
+        return (US_STATES if country_code == "US" else CA_PROVINCES)[code]
+
+    mapping = US_STATES if country_code == "US" else CA_PROVINCES
+    for code, name in mapping.items():
+        if text.casefold() in {name.casefold(), code.casefold()}:
+            return name
+        if text.casefold().startswith(name.casefold() + " -"):
+            return name
+    return text[:60]
 
 
-def distance_km(a: float, b: float, c: float, d: float) -> float:
-    r = 6371.0088
-    p1, p2 = math.radians(a), math.radians(c)
-    dp, dl = math.radians(c - a), math.radians(d - b)
-    x = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * r * math.asin(min(1.0, math.sqrt(x)))
-
-
-def station_state(row: dict[str, Any], default_state: str = "") -> str:
+def station_state(row: dict[str, Any], country_code: str) -> str:
     iso = str(row.get("iso_3166_2") or "").strip().upper()
-    if iso.startswith("US-") and iso[3:] in US_STATES:
-        return US_STATES[iso[3:]]
-    raw = re.sub(r"\s+", " ", str(row.get("state") or "")).strip()
-    if raw:
-        raw = raw.split(",")[0].strip()
-        folded = raw.casefold()
-        if folded in US_STATE_LOOKUP:
-            return US_STATE_LOOKUP[folded]
-        # If a state string has a postal abbreviation suffix/prefix, use it.
-        match = re.search(r"\b([A-Z]{2})\b", raw.upper())
-        if match and match.group(1) in US_STATES:
-            return US_STATES[match.group(1)]
-        return raw[:48]
-    return default_state or "State not listed"
+    if iso in SUBDIVISIONS and iso.startswith(country_code + "-"):
+        return SUBDIVISIONS[iso]
+    return canonical_state(str(row.get("state") or ""), country_code) or "State not listed"
 
 
-def checked_recently(row: dict[str, Any]) -> bool:
-    """Require Radio Browser's latest known health check to be successful and recent."""
-    flag = row.get("lastcheckok")
-    if str(flag).strip() not in {"1", "True", "true"}:
+def is_recently_healthy(row: dict[str, Any]) -> bool:
+    value = row.get("lastcheckok")
+    if str(value).strip().lower() not in {"1", "true"}:
         return False
+
     stamp = str(row.get("lastchecktime_iso8601") or row.get("lastchecktime") or "").strip()
     if not stamp:
         return False
     try:
-        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        age_days = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 86400
-        return -1 <= age_days <= MAX_STATION_AGE_DAYS
+        checked = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - checked.astimezone(timezone.utc)).total_seconds() / 86400
+        return -1 <= age <= MAX_STATION_AGE_DAYS
     except ValueError:
         return False
 
 
-def clean_station(row: dict[str, Any], default_state: str = "") -> dict[str, Any] | None:
-    uid = str(row.get("stationuuid") or "").strip()
+def clean_station(row: dict[str, Any], country_code: str) -> dict[str, Any] | None:
+    uuid = str(row.get("stationuuid") or "").strip()
+    if not uuid or FAILED_PLAY_CACHE.get(uuid, 0) > time.time():
+        return None
     name = re.sub(r"\s+", " ", str(row.get("name") or "")).strip()
-    if not uid or not name or uid in FAILED_PLAY_CACHE and FAILED_PLAY_CACHE[uid] > time.time():
+    if not name or not is_recently_healthy(row):
         return None
-    if not checked_recently(row):
+    try:
+        if int(row.get("hls") or 0) == 1:
+            return None
+    except (TypeError, ValueError):
         return None
-    if int(row.get("hls") or 0) == 1:
-        return None  # parcel music players may not play HLS playlists reliably
+
     stream = str(row.get("url_resolved") or row.get("url") or "").strip()
     parsed = urlparse(stream)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    # Use printable ASCII in dialog labels to avoid UTF-8 byte-limit surprises.
-    ascii_name = name.encode("ascii", "ignore").decode("ascii")
-    ascii_name = re.sub(r"\s+", " ", ascii_name).strip()
-    if not ascii_name:
-        ascii_name = "Unnamed station"
+
+    # Keep menu content ASCII and compact for Second Life llDialog.
+    display_name = name.encode("ascii", "ignore").decode("ascii")
+    display_name = re.sub(r"\s+", " ", display_name).strip() or "Unnamed station"
     return {
-        "name": ascii_name[:55],
-        "uuid": uid,
-        "state": station_state(row, default_state),
+        "name": display_name[:48],
+        "uuid": uuid,
+        "state": station_state(row, country_code),
         "codec": str(row.get("codec") or "Unknown")[:12],
         "bitrate": int(row.get("bitrate") or 0),
-        "lastcheckok": 1,
-        "lastchecktime": str(row.get("lastchecktime") or "")[:19],
     }
 
 
-def build_station_catalog(area: str, place: dict[str, Any]) -> dict[str, Any]:
+def get_state_list(country_code: str) -> list[dict[str, Any]]:
     now = time.time()
-    cached = STATION_CACHE.get(area)
+    cached = STATE_CACHE.get(country_code)
     if cached and cached[0] > now:
         return cached[1]
-    country = str(place["country_code"]).upper()
-    origin = str(place.get("state") or "").strip()
-    origin_fold = origin.casefold()
-    lat, lon = float(place["latitude"]), float(place["longitude"])
-    by_uuid: dict[str, dict[str, Any]] = {}
 
-    # First: all verified indexed streams within the selected origin state.
-    if origin:
-        rows = rb_json("/json/stations/search", {
-            "countrycode": country, "state": origin, "stateExact": "true",
-            "hidebroken": "true", "order": "clickcount", "reverse": "true", "limit": 100000,
-        })
-        if isinstance(rows, list):
-            for row in rows:
-                station = clean_station(row, origin)
-                if station:
-                    by_uuid[station["uuid"]] = station
+    country_name = COUNTRIES[country_code]
+    rows = rb_json(
+        "/json/states",
+        params={
+            "country": API_COUNTRIES[country_code],
+            "hidebroken": "true",
+            "order": "stationcount",
+            "reverse": "true",
+            "limit": 1000,
+        },
+    )
+    if not isinstance(rows, list):
+        raise RuntimeError("Radio Browser returned an unexpected state list.")
 
-    # Second: verified geotagged stations from the same country, locally radius-filtered.
-    geo_rows = rb_json("/json/stations/search", {
-        "countrycode": country, "has_geo_info": "true", "hidebroken": "true",
-        "order": "clickcount", "reverse": "true", "limit": 100000,
-    })
-    if not isinstance(geo_rows, list):
-        raise RuntimeError("Radio Browser returned an invalid station list.")
-    for row in geo_rows:
+    seen: set[str] = set()
+    states: list[dict[str, Any]] = []
+    for row in rows:
+        raw_name = str(row.get("name") or "").strip()
+        if not raw_name:
+            continue
+        name = canonical_state(raw_name, country_code)
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
         try:
-            slat, slon = float(row.get("geo_lat")), float(row.get("geo_long"))
+            count = max(0, int(row.get("stationcount") or 0))
         except (TypeError, ValueError):
+            count = 0
+        if count:
+            states.append({"name": name, "count": count})
+
+    states.sort(key=lambda item: (-item["count"], item["name"].casefold()))
+    STATE_CACHE[country_code] = (now + 1800, states)
+    return states
+
+
+def get_state_stations(country_code: str, state_name: str) -> list[dict[str, Any]]:
+    cache_key = (country_code, state_name.casefold())
+    now = time.time()
+    cached = STATION_CACHE.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    rows = rb_json(
+        "/json/stations/search",
+        params={
+            "countrycode": country_code,
+            "state": state_name,
+            "hidebroken": "true",
+            "order": "clickcount",
+            "reverse": "true",
+            "limit": 100000,
+        },
+    )
+    if not isinstance(rows, list):
+        raise RuntimeError("Radio Browser returned an unexpected station list.")
+
+    by_uuid: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        station = clean_station(row, country_code)
+        if not station:
             continue
-        if distance_km(lat, lon, slat, slon) > SEARCH_RADIUS_KM:
+        # Prevent substring matches from leaking stations from a different state.
+        if station["state"].casefold() != state_name.casefold():
             continue
-        station = clean_station(row, "")
-        if station:
-            by_uuid[station["uuid"]] = station
+        by_uuid[station["uuid"]] = station
 
     stations = list(by_uuid.values())
-    stations.sort(key=lambda x: (
-        0 if x["state"].casefold() == origin_fold else 1,
-        x["state"].casefold(),
-        -x["bitrate"],
-        x["name"].casefold(),
-    ))
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for station in stations:
-        groups.setdefault(station["state"], []).append(station)
-    state_names = sorted(groups, key=lambda s: (0 if s.casefold() == origin_fold else 1, s.casefold()))
-    result = {
-        "area": area, "location": place["location"], "origin_state": origin,
-        "country_code": country, "radius_km": SEARCH_RADIUS_KM,
-        "total_stations": len(stations),
-        "filtered_states": len(groups),
-        "states": [{"name": state, "count": len(groups[state])} for state in state_names],
-        "by_state": groups,
-    }
-    STATION_CACHE[area] = (now + 600, result)
-    return result
+    stations.sort(key=lambda item: (-item["bitrate"], item["name"].casefold()))
+    STATION_CACHE[cache_key] = (now + 900, stations)
+    return stations
 
 
 @app.get("/")
 def home():
-    return jsonify(ok=True, service="VixinVenom Area Radio", version="6.0",
-                   endpoints=["/health", "/states?area=775&band=fm", "/stations?area=775&state=Nevada&band=fm&page=0", "/play?uuid=STATION_UUID"])
+    return jsonify(
+        ok=True,
+        service="VixinVenom State Radio",
+        version="7.0",
+        endpoints=[
+            "/health",
+            "/countries",
+            "/states?country=US",
+            "/stations?country=US&state=Nevada&page=0",
+            "/play?uuid=STATION_UUID",
+        ],
+    )
 
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, service="VixinVenom Area Radio", version="6.0",
-                   station_check="Radio Browser lastcheckok + recent check + live probe on play",
-                   dialog_page_size=PAGE_SIZE)
+    return jsonify(
+        ok=True,
+        service="VixinVenom State Radio",
+        version="7.0",
+        browse_mode="country_then_state",
+        dialog_page_size=PAGE_SIZE,
+        station_check="Radio Browser recent health check plus live probe on play",
+    )
+
+
+@app.get("/countries")
+def countries():
+    return jsonify(ok=True, countries=[
+        {"code": code, "name": name}
+        for code, name in COUNTRIES.items()
+    ])
 
 
 @app.get("/states")
 def states():
-    area = (request.args.get("area") or "").strip()
-    band = (request.args.get("band") or "fm").strip().lower()
-    if not re.fullmatch(r"[2-9][0-9]{2}", area):
-        return jsonify(ok=False, error="Enter a valid three-digit North American area code."), 400
-    if band not in {"am", "fm"}:
-        return jsonify(ok=False, error="Band must be am or fm."), 400
+    country_code = (request.args.get("country") or "").strip().upper()
+    if country_code not in COUNTRIES:
+        return jsonify(ok=False, error="Choose US or CA."), 400
     try:
-        place = resolve_area_code(area)
-        catalog = build_station_catalog(area, place)
-        return jsonify(ok=True, version="6.0", area=area, band=band,
-                       location=catalog["location"], origin_state=catalog["origin_state"],
-                       radius_km=catalog["radius_km"], total_stations=catalog["total_stations"],
-                       states=catalog["states"],
-                       note="Stations are grouped by directory state/province. AM/FM are browse labels; streams are internet radio.")
-    except (requests.RequestException, RuntimeError, ValueError, KeyError, TypeError) as exc:
-        app.logger.exception("State list failed for area=%s", area)
+        available = get_state_list(country_code)
+        return jsonify(
+            ok=True,
+            version="7.0",
+            country=country_code,
+            country_name=COUNTRIES[country_code],
+            total_states=len(available),
+            states=available,
+        )
+    except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
+        app.logger.exception("State list failed for country=%s", country_code)
         return jsonify(ok=False, error=str(exc) or "State lookup failed."), 502
 
 
 @app.get("/stations")
 def stations():
-    area = (request.args.get("area") or "").strip()
-    band = (request.args.get("band") or "fm").strip().lower()
-    state = (request.args.get("state") or "").strip()
+    country_code = (request.args.get("country") or "").strip().upper()
+    state_name = re.sub(r"\s+", " ", (request.args.get("state") or "")).strip()
     try:
         page = max(0, int(request.args.get("page", "0")))
     except ValueError:
         return jsonify(ok=False, error="Page must be a non-negative integer."), 400
-    if not re.fullmatch(r"[2-9][0-9]{2}", area):
-        return jsonify(ok=False, error="Enter a valid three-digit North American area code."), 400
-    if band not in {"am", "fm"} or not state:
-        return jsonify(ok=False, error="Select a state and AM/FM browse view."), 400
+
+    if country_code not in COUNTRIES:
+        return jsonify(ok=False, error="Choose US or CA."), 400
+    if not state_name or len(state_name) > 80:
+        return jsonify(ok=False, error="Choose a state or province."), 400
+
     try:
-        place = resolve_area_code(area)
-        catalog = build_station_catalog(area, place)
-        state_map = {s.casefold(): s for s in catalog["by_state"]}
-        canonical = state_map.get(state.casefold())
-        if not canonical:
-            return jsonify(ok=True, version="6.0", area=area, state=state, band=band,
-                           total_stations=0, page=page, page_size=PAGE_SIZE,
-                           has_more=False, stations=[])
-        rows = catalog["by_state"][canonical]
+        canonical = canonical_state(state_name, country_code)
+        known_states = {item["name"].casefold() for item in get_state_list(country_code)}
+        if canonical.casefold() not in known_states:
+            return jsonify(ok=False, error="That state or province is not in the current directory."), 404
+
+        catalog = get_state_stations(country_code, canonical)
         start = page * PAGE_SIZE
-        batch = rows[start:start + PAGE_SIZE]
-        return jsonify(ok=True, version="6.0", area=area, band=band,
-                       location=catalog["location"], state=canonical,
-                       total_stations=len(rows), page=page, page_size=PAGE_SIZE,
-                       has_more=(start + PAGE_SIZE < len(rows)),
-                       stations=batch)
-    except (requests.RequestException, RuntimeError, ValueError, KeyError, TypeError) as exc:
-        app.logger.exception("Station page failed for area=%s state=%s", area, state)
+        batch = catalog[start:start + PAGE_SIZE]
+        return jsonify(
+            ok=True,
+            version="7.0",
+            country=country_code,
+            country_name=COUNTRIES[country_code],
+            state=canonical,
+            total_stations=len(catalog),
+            page=page,
+            page_size=PAGE_SIZE,
+            has_more=(start + PAGE_SIZE < len(catalog)),
+            stations=batch,
+            note="Internet radio streams, not verified terrestrial AM/FM broadcasts.",
+        )
+    except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
+        app.logger.exception("Station page failed country=%s state=%s", country_code, state_name)
         return jsonify(ok=False, error=str(exc) or "Station search failed."), 502
 
 
 def live_probe(stream_url: str) -> tuple[bool, str, str]:
-    """Open the stream briefly to confirm it currently accepts an HTTP request."""
     response = None
     try:
-        response = requests.get(stream_url, stream=True, allow_redirects=True,
-            headers={"User-Agent": USER_AGENT, "Icy-MetaData": "0"},
-            timeout=(PLAY_CONNECT_TIMEOUT, PLAY_READ_TIMEOUT))
+        response = requests.get(
+            stream_url,
+            stream=True,
+            allow_redirects=True,
+            headers={"User-Agent": USER_AGENT, "Icy-MetaData": "0", "Range": "bytes=0-0"},
+            timeout=(PLAY_CONNECT_TIMEOUT, PLAY_READ_TIMEOUT),
+        )
         if response.status_code >= 400:
             return False, f"Stream server returned HTTP {response.status_code}.", ""
         content_type = str(response.headers.get("Content-Type") or "").lower()
-        if "text/html" in content_type or "application/json" in content_type:
-            return False, "Station returned a web page instead of an audio stream.", ""
+        if any(marker in content_type for marker in ("text/html", "application/json", "text/plain")):
+            return False, "Station returned a web page or text instead of audio.", ""
+        # Headers alone are not enough: read one byte to verify that the server
+        # actually begins sending a stream. The read timeout bounds the wait.
+        first_byte = response.raw.read(1, decode_content=True)
+        if not first_byte:
+            return False, "Station connected but did not send audio data.", ""
         final_url = response.url or stream_url
         parsed = urlparse(final_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return False, "Station redirected to an invalid URL.", ""
         return True, "Stream accepted the connection.", final_url
-    except requests.RequestException as exc:
-        return False, f"Station did not accept a quick connection check ({type(exc).__name__}).", ""
+    except Exception as exc:
+        return False, f"Station did not accept the connection check ({type(exc).__name__}).", ""
     finally:
         if response is not None:
             response.close()
@@ -378,25 +421,42 @@ def play():
     uuid = (request.args.get("uuid") or "").strip()
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", uuid):
         return jsonify(ok=False, error="Invalid station ID."), 400
+    if FAILED_PLAY_CACHE.get(uuid, 0) > time.time():
+        return jsonify(ok=False, error="This station recently failed playback. Choose another."), 409
+
     try:
-        record = rb_json("/json/stations/byuuid", {"uuids": uuid})
-        if not record or not checked_recently(record[0]) or int(record[0].get("hls") or 0) == 1:
+        records = rb_json("/json/stations/byuuid", {"uuids": uuid})
+        if not records:
+            return jsonify(ok=False, error="Station is no longer listed."), 404
+        record = records[0]
+        country_code = str(record.get("countrycode") or "US").upper()
+        if not is_recently_healthy(record) or int(record.get("hls") or 0) == 1:
             FAILED_PLAY_CACHE[uuid] = time.time() + 21600
-            return jsonify(ok=False, error="Directory health check is not current or station is marked offline. Choose another station."), 409
-        payload = rb_json("/json/url/" + uuid)
-        stream_url = str(payload.get("url") or record[0].get("url_resolved") or "").strip()
+            return jsonify(ok=False, error="Directory health check is old or station is offline. Choose another."), 409
+
+        stream_url = str(record.get("url_resolved") or record.get("url") or "").strip()
         parsed = urlparse(stream_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             FAILED_PLAY_CACHE[uuid] = time.time() + 21600
-            return jsonify(ok=False, error="Station has no usable HTTP audio URL."), 502
+            return jsonify(ok=False, error="Station has no usable direct HTTP audio URL."), 502
+
         ok, message, final_url = live_probe(stream_url)
         if not ok:
             FAILED_PLAY_CACHE[uuid] = time.time() + 21600
-            STATION_CACHE.clear()
-            return jsonify(ok=False, error=message + " This station has been hidden for 6 hours; select another."), 409
-        return jsonify(ok=True, name=record[0].get("name") or "Radio station", url=final_url,
-                       codec=record[0].get("codec") or "Unknown", bitrate=record[0].get("bitrate") or 0,
-                       checked_at=record[0].get("lastchecktime") or "unknown")
+            for key in list(STATION_CACHE):
+                STATION_CACHE.pop(key, None)
+            return jsonify(ok=False, error=message + " This station is hidden for 6 hours."), 409
+
+        return jsonify(
+            ok=True,
+            name=record.get("name") or "Radio station",
+            url=final_url,
+            country=COUNTRIES.get(country_code, country_code),
+            state=station_state(record, country_code),
+            codec=record.get("codec") or "Unknown",
+            bitrate=record.get("bitrate") or 0,
+            checked_at=record.get("lastchecktime") or "unknown",
+        )
     except (requests.RequestException, RuntimeError, ValueError, TypeError, IndexError) as exc:
         app.logger.exception("Station play check failed uuid=%s", uuid)
         return jsonify(ok=False, error=str(exc) or "Could not verify station stream."), 502
